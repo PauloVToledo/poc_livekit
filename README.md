@@ -76,7 +76,66 @@ lk agent console --text
 
 Clara saluda y pregunta por un proyecto reciente. `m` silencia el micrófono;
 `Ctrl+T` cambia entre voz y texto; `?` muestra los atajos. Detén con `Ctrl+C`
-(también `q` en modo voz). No hay temporizador de entrevista.
+(también `q` en modo voz). Por defecto la entrevista comienza automáticamente y
+solicita el cierre a los 300 segundos desde el primer playback de Clara.
+
+## Entrevista controlada para testing
+
+```dotenv
+INTERVIEW_AUTO_START=true
+INTERVIEW_DURATION_SECONDS=300
+INTERVIEW_AUTO_CLOSE=true
+```
+
+Los valores anteriores son también los defaults; no necesitas copiarlos al `.env`.
+La introducción y despedida son textos fijos enviados con `session.say()`, sin
+mensajes artificiales de usuario. La conversación conserva OpenAI Responses y
+los proveedores actuales. La introducción se solicita una sola vez, después de
+`session.start()` y, en WebRTC, `room_io.wait_for_ready()`; con Runway se espera
+además el primer frame del avatar antes de arrancar la sesión.
+
+El evento `playback_started` de la salida de audio inicia un reloj monotónico y
+una tarea async independiente. Con Runway 1.8.5 este evento aproxima el inicio
+con el primer frame de audio enviado al avatar; no demuestra el instante exacto
+en que el navegador lo reproduce. En modo texto se usa el primer mensaje de
+Clara confirmado en el historial y se registra esa diferencia.
+
+Al vencer el plazo se bloquean respuestas normales nuevas mediante
+`on_user_turn_completed`/`StopResponse` y `llm_node`, incluida generación
+anticipada nueva. El transcript STT sigue en el log aunque `StopResponse` omite
+ese último turno del historial conversacional nativo. El controlador espera
+`wait_for_idle()` hasta 30 segundos para permitir terminar el turno del candidato.
+Si supera esa espera, conserva el playback de Clara en curso antes de despedirse.
+La despedida usa `allow_interruptions=False` únicamente para ese mensaje;
+introducción y conversación conservan las interrupciones habituales.
+Se espera `SpeechHandle.wait_for_playout()`, se comprueba su error/interrupción y
+se llama `shutdown(drain=True)`. El evento `close` termina el job para generar
+el reporte. No se elimina la sala. Las tareas se cancelan al desconectarse el
+candidato, cerrarse la sesión o finalizar el job.
+
+El tiempo total puede superar 300 segundos por el turno pendiente, audio en curso
+y despedida. `INTERVIEW_AUTO_START=false` omite la introducción automática y
+comienza el reloj con la primera respuesta de Clara; `INTERVIEW_AUTO_CLOSE=false`
+registra el timeout y permite continuar la conversación. Para ensayos de 5–10
+minutos desactiva el cierre o aumenta la duración.
+
+Con avatar usa `RUNWAY_MAX_DURATION_SECONDS=900`: el límite del proveedor empieza
+antes que la entrevista y debe dejar margen para preparar la sesión y despedirse.
+Un `.env` existente con `300` puede desconectar el avatar prematuramente.
+`RUNWAY_ENABLED=false` conserva el mismo controlador y la salida de audio LiveKit.
+
+Los eventos `interview_started`, `interview_elapsed_seconds` (cada 30 segundos),
+`interview_timeout_reached`, `interview_closing` e `interview_finished` quedan en
+`outputs/agent.log` y `poc.interview_events` del reporte. `interview_finished.reason`
+distingue playback final completado de desconexión/cierre anticipado.
+
+Para verificar manualmente, guarda una sesión terminal con `--record` y otra
+WebRTC con/sin avatar. Permanece en silencio al conectar, comprueba una sola
+introducción, habla cerca del segundo 300, confirma ausencia de nuevas preguntas,
+despedida completa y `session_end` con reporte. Repite abandonando antes del
+timeout y comprueba que no se reproduce una despedida tardía. Para un ensayo
+corto puedes establecer temporalmente `INTERVIEW_DURATION_SECONDS=15` en el
+entorno; después elimina esa variable para recuperar el valor del `.env`/default.
 
 ## WebRTC con Agent Console
 

@@ -67,6 +67,7 @@ class Observation:
         self.config = config
         self.session_started = False
         self.avatar_events: list[dict] = []
+        self.interview_events: list[dict] = []
         self.component_metrics: list[dict] = []
         self.interruption_evidence: list[dict] = []
         self.interruption_mode = "no observado"
@@ -74,6 +75,8 @@ class Observation:
         self.diagnostic_handler = InterruptionDiagnostics(self)
 
     def log(self, event: str, data) -> None:
+        if event.startswith("interview_"):
+            self.interview_events.append({"event": event, "timestamp": time.time(), "data": data})
         if event.startswith("avatar_") or event == "session_start_failed":
             self.avatar_events.append({"event": event, "timestamp": time.time(), "data": data})
         logger.info("session=%s event=%s %s", self.id, event,
@@ -136,6 +139,8 @@ class InterruptionDiagnostics(logging.Handler):
 
 
 async def save_report(ctx: JobContext) -> None:
+    if interview := ctx.proc.userdata.pop("clara_interview", None):
+        await interview.aclose()
     if visual := ctx.proc.userdata.pop("clara_visual", None):
         await visual.aclose()
     observation = ctx.proc.userdata.pop("clara_observation", None)
@@ -159,6 +164,7 @@ async def save_report(ctx: JobContext) -> None:
         "interruption_mode": observation.interruption_mode,
         "sdk_diagnostics": observation.sdk_diagnostics,
         "avatar_events": observation.avatar_events,
+        "interview_events": observation.interview_events,
     }
     session_id = re.sub(r"[^A-Za-z0-9_.-]", "_", observation.id)
     path = ROOT / "outputs" / session_id / "report.json"
