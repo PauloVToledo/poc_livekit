@@ -1,0 +1,13 @@
+[project]
+name = "clara-livekit-poc"
+version = "0.1.0"
+description = "POC local de Clara con LiveKit y proveedores directos"
+requires-python = "==3.13.*"
+dependencies = [
+    "livekit-agents==1.8.5",
+    "livekit-plugins-deepgram==1.8.5",
+    "livekit-plugins-openai==1.8.5",
+    "livekit-plugins-elevenlabs==1.8.5",
+    "livekit-plugins-runway==1.8.5",
+    "python-dotenv",
+]
