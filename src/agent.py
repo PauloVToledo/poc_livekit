@@ -303,6 +303,8 @@ class RunwayVisual:
             self.stopping = True
             self.ready.set()
             self.observation.log("avatar_failure", {"reason": reason})
+            self.observation.timeline("avatar_video_status", time.time(),
+                                      "runway_visual_failure", status="failed", reason=reason)
             self.ctx.shutdown(reason=reason)
 
     def on_session_close(self, event) -> None:
@@ -334,6 +336,8 @@ class RunwayVisual:
         if (participant.identity == self.avatar.avatar_identity
                 and track.kind == rtc.TrackKind.KIND_VIDEO and self.video_task is None
                 and not self.closing):
+            self.observation.timeline("avatar_video_status", time.time(),
+                                      "livekit_track_subscribed", status="track_subscribed")
             self.video_task = asyncio.create_task(self.wait_first_frame(track))
 
     async def wait_first_frame(self, track) -> None:
@@ -345,6 +349,8 @@ class RunwayVisual:
                     "startup_seconds": time.monotonic() - self.started_at,
                     "evidence": "first_video_frame_received",
                 })
+                self.observation.timeline("avatar_video_status", time.time(),
+                                          "livekit_video_stream", status="first_frame_received")
                 self.ready.set()
                 break
             if not self.ready.is_set():
@@ -439,6 +445,7 @@ async def clara_session(ctx: JobContext) -> None:
             ])
         await session.start(agent=Clara(interview), room=ctx.room, **options)
         observation.session_started = True
+        observation.attach_audio_output()
         if not config["runway_active"]:
             await ctx.connect()
         if config["mode"] != "console":
