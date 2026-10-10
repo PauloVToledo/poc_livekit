@@ -23,7 +23,6 @@ load_dotenv(ROOT / ".env", override=False)
 logger = logging.getLogger("clara")
 AVATAR_START_TIMEOUT_SECONDS = 60
 AVATAR_CLOSE_TIMEOUT_SECONDS = 5
-INTERVIEW_TURN_GRACE_SECONDS = 30
 INTERVIEW_INTRODUCTION = (
     "Hola, soy Clara de Datta. Gracias por participar en esta entrevista. "
     "Durante los próximos minutos me gustaría conocer un poco sobre tu experiencia "
@@ -33,6 +32,10 @@ INTERVIEW_INTRODUCTION = (
 INTERVIEW_CLOSING = (
     "Perfecto, con esto terminamos la entrevista. Muchas gracias por tu tiempo "
     "y por compartir tu experiencia. Ha sido un gusto conversar contigo."
+)
+INTERVIEW_FINAL_QUESTION = (
+    "Ya hemos llegado al final de los cinco minutos de entrevista. "
+    "Antes de despedirnos, ¿hay algo más que te gustaría añadir?"
 )
 
 
@@ -77,6 +80,12 @@ def load_config(mode: str) -> dict:
             raise ValueError("RUNWAY_MAX_DURATION_SECONDS debe ser un entero positivo") from None
         if max_duration <= 0:
             raise ValueError("RUNWAY_MAX_DURATION_SECONDS debe ser un entero positivo")
+        if auto_close and max_duration <= duration + AVATAR_START_TIMEOUT_SECONDS:
+            raise ValueError(
+                "RUNWAY_MAX_DURATION_SECONDS debe superar INTERVIEW_DURATION_SECONDS "
+                "+ 60 segundos de arranque y dejar margen para los turnos finales "
+                "y la despedida (recomendado: 900 para una entrevista de 300 segundos)"
+            )
     required = ["DEEPGRAM_API_KEY", "OPENAI_API_KEY", "ELEVEN_API_KEY", "ELEVEN_VOICE_ID"]
     if mode != "console":
         required += ["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"]
@@ -90,7 +99,6 @@ def load_config(mode: str) -> dict:
         "interview_auto_start": auto_start,
         "interview_auto_close": auto_close,
         "interview_duration_seconds": duration,
-        "interview_turn_grace_seconds": INTERVIEW_TURN_GRACE_SECONDS,
         "deepgram_model": os.getenv("DEEPGRAM_MODEL") or "nova-3",
         "deepgram_language": os.getenv("DEEPGRAM_LANGUAGE") or "multi",
         "openai_model": os.getenv("OPENAI_MODEL") or "gpt-4.1-mini",
@@ -115,6 +123,7 @@ class Clara(Agent):
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
     ) -> None:
         if self.interview.block_normal_reply:
+            self.interview.on_user_turn_completed(new_message)
             raise StopResponse()
 
     def llm_node(self, chat_ctx: llm.ChatContext, tools: list[llm.Tool], model_settings: ModelSettings):
@@ -140,6 +149,8 @@ class InterviewControl:
         self.introduction_requested = False
         self.timer_task: asyncio.Task | None = None
         self.introduction_task: asyncio.Task | None = None
+        self.awaiting_final_answer = False
+        self.final_answer_completed = asyncio.Event()
         self.audio_output = None
         self.session.on("close", self.on_close)
         self.session.on("conversation_item_added", self.on_item)
@@ -168,6 +179,15 @@ class InterviewControl:
 
     def on_playback_started(self, event) -> None:
         self.begin("audio_output_playback_started")
+
+    def on_user_turn_completed(self, message: llm.ChatMessage) -> None:
+        # El hook se ejecuta tras endpointing/STT y detección de fin de turno,
+        # no al primer silencio del VAD. Incluye respuestas que interrumpen la pregunta.
+        if self.awaiting_final_answer and (message.text_content or "").strip():
+            self.observation.log("interview_final_answer_completed", {
+                "seconds": self.elapsed_seconds, "message_id": message.id,
+            })
+            self.final_answer_completed.set()
 
     def on_item(self, event) -> None:
         # El modo texto no tiene playback; usar el primer mensaje de Clara.
@@ -206,16 +226,22 @@ class InterviewControl:
             if not self.config["interview_auto_close"]:
                 return
             self.closing = True
-            try:
-                # Incluye endpointing/STT pendiente, no solo silencio del VAD.
-                await asyncio.wait_for(
-                    self.session.wait_for_idle(), timeout=INTERVIEW_TURN_GRACE_SECONDS
-                )
-            except TimeoutError:
-                self.observation.log("interview_turn_grace_exceeded", {"seconds": self.elapsed_seconds})
-                # El timeout cancela la espera, nunca el speech/TTS en curso.
-                if speech := self.session.current_speech:
-                    await speech.wait_for_playout()
+            # Sin límite de 30 s: nunca despedirse encima del candidato.
+            # Incluye el turno pendiente, endpointing/STT y el audio de Clara en curso.
+            await self.session.wait_for_idle()
+            if self.stopped:
+                return
+            self.observation.log("interview_final_question", {"seconds": self.elapsed_seconds})
+            self.awaiting_final_answer = True
+            speech = self.session.say(INTERVIEW_FINAL_QUESTION, allow_interruptions=True)
+            await speech.wait_for_playout()
+            if error := speech.exception():
+                raise RuntimeError("Falló el TTS de la pregunta final") from error
+            # Una interrupción real puede ser la propia respuesta del candidato.
+            # El silencio por sí solo no completa esta interacción.
+            await self.final_answer_completed.wait()
+            await self.session.wait_for_idle()
+            self.awaiting_final_answer = False
             if self.stopped:
                 return
             self.observation.log("interview_closing", {"seconds": self.elapsed_seconds})
@@ -226,6 +252,9 @@ class InterviewControl:
             if speech.interrupted:
                 raise RuntimeError("El playback del cierre fue interrumpido")
             self.finish("closing_playback_completed")
+            # Terminar Runway mientras la sala sigue conectada, tras el último audio.
+            if visual := self.ctx.proc.userdata.get("clara_visual"):
+                await visual.aclose()
             self.session.shutdown(drain=True)
         except asyncio.CancelledError:
             raise
